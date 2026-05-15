@@ -2,9 +2,14 @@
 evaluate.py — compare Fisher vs Learned Shapley on downstream tasks
 """
 import argparse
-import torch
 import os
-from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+from pathlib import Path
+
+from model_utils import load_tokenizer_and_causal_lm
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_DEFAULT_MODEL = str(_REPO_ROOT / "Qwen2.5-3B-Instruct")
 
 
 def load_scores(output_dir: str, metric: str) -> dict:
@@ -55,10 +60,7 @@ def evaluate_perplexity(model, tokenizer, texts: list) -> float:
 
 
 def main(args):
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, torch_dtype=torch.bfloat16, device_map="auto"
-    )
+    tokenizer, model = load_tokenizer_and_causal_lm(args.model)
 
     # sample eval texts
     eval_texts = [
@@ -68,7 +70,7 @@ def main(args):
     ] * 10
 
     results = {}
-    for metric in ["shapley_fisher", "shapley_learned", "gradient"]:
+    for metric in ["shapley_fisher", "shapley_learned_a", "shapley_learned_b", "gradient"]:
         try:
             scores = load_scores(args.output_dir, metric)
         except FileNotFoundError:
@@ -89,7 +91,7 @@ def main(args):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--model", default="/data/Qwen/Qwen2.5-3B-Instruct")
+    p.add_argument("--model", default=_DEFAULT_MODEL)
     p.add_argument("--output_dir", default="./results")
     p.add_argument("--top_k", type=float, default=0.1)
     main(p.parse_args())

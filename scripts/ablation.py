@@ -5,13 +5,18 @@ ablation.py — run ablation experiments
   C. Calibration data size ablation
 """
 import argparse
+from pathlib import Path
 import torch
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer
 from torch.utils.data import DataLoader
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_DEFAULT_MODEL = str(_REPO_ROOT / "Qwen2.5-3B-Instruct")
+
+from model_utils import load_tokenizer_and_causal_lm
+
 from neural_function import (
-    CurvatureSurrogate, train_surrogate,
+    CurvatureSurrogate,
     extract_block_features, compute_hessian_diag_hutchinson,
     compute_and_cache_metrics,
 )
@@ -145,10 +150,7 @@ def run_calib_size_ablation(model, full_loader, sizes=(16, 32, 64, 128)):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main(args):
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, torch_dtype=torch.bfloat16, device_map="auto"
-    )
+    tokenizer, model = load_tokenizer_and_causal_lm(args.model)
 
     from run_experiment import DummyDataset, collate
     dataset = DummyDataset(tokenizer, n=128)
@@ -161,5 +163,5 @@ def main(args):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--model", default="/data/Qwen/Qwen2.5-3B-Instruct")
+    p.add_argument("--model", default=_DEFAULT_MODEL)
     main(p.parse_args())

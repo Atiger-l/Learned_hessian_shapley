@@ -2,14 +2,71 @@
 neural_function.py — drop-in replacement for ModelShapley's neural_function.py
 Adds learned curvature surrogate alongside the original Fisher-based Shapley.
 """
+import gc
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import random
+from contextlib import contextmanager
 from tqdm import tqdm
 from collections import defaultdict
 from torch.utils.data import DataLoader
 from transformers import PreTrainedModel
+
+try:
+    from torch.nn.attention import SDPBackend, sdpa_kernel as _sdpa_kernel_new
+
+    def _sdp_math_ctx():
+        return _sdpa_kernel_new(backends=[SDPBackend.MATH])
+
+except ImportError:
+    _sdp_math_ctx = None
+
+
+@contextmanager
+def _second_order_safe_attention():
+    """Flash/mem-efficient SDPA backward is not higher-order differentiable; HVP needs math SDP."""
+    if not (torch.backends.cuda.is_built() and torch.cuda.is_available()):
+        yield
+        return
+    if _sdp_math_ctx is not None:
+        with _sdp_math_ctx():
+            yield
+        return
+    sdp = getattr(torch.backends.cuda, "sdp_kernel", None)
+    if sdp is None:
+        yield
+        return
+    with sdp(enable_flash=False, enable_mem_efficient=False, enable_math=True):
+        yield
+
+
+def _infer_causal_lm_input_device(model: PreTrainedModel) -> torch.device:
+    """Device for input_ids / attention_mask (must match embedding forward).
+
+    Under ``device_map=\"auto\"`` or Accelerate hooks, ``embed.weight.device`` can
+    still be CPU while the op runs on GPU — then batch must go to a real CUDA device.
+    """
+    emb = model.get_input_embeddings()
+    if emb is not None and emb.weight.device.type == "cuda":
+        return emb.weight.device
+    for name, p in model.named_parameters():
+        if p.device.type == "cuda" and "embed" in name.lower():
+            return p.device
+    for p in model.parameters():
+        if p.device.type == "cuda":
+            return p.device
+    if torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    if emb is not None:
+        return emb.weight.device
+    return next(model.parameters()).device
+
+
+def _move_batch_tensors_(batch: dict, device: torch.device) -> None:
+    """In-place: put all tensor fields on device (mutates batch like existing pop(loss_mask))."""
+    for k, v in list(batch.items()):
+        if torch.is_tensor(v):
+            batch[k] = v.to(device)
 
 
 # ─────────────────────────────────────────────
@@ -20,12 +77,19 @@ def param_cache_check(name: str, param: torch.nn.Parameter) -> bool:
     return "model.layers" in name and param.ndim == 2
 
 
+def clone_lm_batch(batch: dict) -> dict:
+    """Copy tensors so ``loss_mask`` pop in loss helpers does not corrupt shared dicts."""
+    return {k: v.clone() if torch.is_tensor(v) else v for k, v in batch.items()}
+
+
 @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
 def compute_loss_and_backward(model: PreTrainedModel, model_inputs: dict):
-    input_ids = model_inputs["input_ids"].cuda()
-    loss_mask = model_inputs.pop("loss_mask")[:, :-1].reshape(-1).cuda()
+    device = _infer_causal_lm_input_device(model)
+    _move_batch_tensors_(model_inputs, device)
+    input_ids = model_inputs["input_ids"]
+    loss_mask = model_inputs.pop("loss_mask")[:, :-1].reshape(-1)
     loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
-    outputs = model(**model_inputs)
+    outputs = model(**model_inputs, use_cache=False)
     logits = outputs.logits
     labels = input_ids[:, 1:].contiguous()
     shift_logits = logits[..., :-1, :].contiguous().view(-1, model.config.vocab_size)
@@ -57,18 +121,26 @@ def calculate_shapley_fisher(param: torch.nn.Parameter) -> torch.Tensor:
     return calculate_individual_importance(param) + 0.5 * calculate_cooperative_interactions_fisher(param)
 
 
-def compute_loss_and_backward_with_graph(model: PreTrainedModel, model_inputs: dict):
-    """前向+反向，保留计算图（create_graph=True），用于二阶自动微分。"""
-    input_ids = model_inputs["input_ids"].cuda()
-    loss_mask = model_inputs.pop("loss_mask")[:, :-1].reshape(-1).cuda()
+def _forward_causal_lm_loss(model: PreTrainedModel, model_inputs: dict) -> torch.Tensor:
+    """因果 LM 的标量 CE loss；会 pop 掉 ``loss_mask``（与原先 with_graph 路径一致）。"""
+    device = _infer_causal_lm_input_device(model)
+    _move_batch_tensors_(model_inputs, device)
+    input_ids = model_inputs["input_ids"]
+    loss_mask = model_inputs.pop("loss_mask")[:, :-1].reshape(-1)
     loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        outputs = model(**model_inputs)
+        outputs = model(**model_inputs, use_cache=False)
     logits = outputs.logits
     shift_logits = logits[..., :-1, :].contiguous().view(-1, model.config.vocab_size)
     shift_labels = input_ids[:, 1:].contiguous().view(-1).to(shift_logits.device)
     loss = loss_fct(shift_logits.float(), shift_labels)
     loss = torch.sum(loss * loss_mask.to(loss.device)) / torch.sum(loss_mask)
+    return loss
+
+
+def compute_loss_and_backward_with_graph(model: PreTrainedModel, model_inputs: dict):
+    """前向+反向，保留计算图（create_graph=True），用于二阶自动微分。"""
+    loss = _forward_causal_lm_loss(model, model_inputs)
     # create_graph=True 保留计算图，允许对梯度再求梯度
     grads = torch.autograd.grad(loss, [p for p in model.parameters() if p.requires_grad],
                                 create_graph=True, allow_unused=True)
@@ -90,38 +162,67 @@ def compute_hessian_diag_hutchinson(
     """
     方案 A teacher signal: diag(H) ≈ E[v ⊙ Hv], v ~ Rademacher.
     Hv 通过 PyTorch 二阶自动微分精确计算。
-    Returns {param_name: diag_tensor (shape = param.shape)}.
+    Returns {param_name: diag_tensor (shape = param.shape), **CPU float tensors**}.
     """
     model.eval()
-    diag_accum = {}
+    diag_accum: dict[str, torch.Tensor] = {}
 
     for _ in range(n_samples):
         model.zero_grad()
         batch = next(iter(dataloader))
 
-        # 第一次前向+反向，保留计算图用于二阶微分
-        loss = compute_loss_and_backward_with_graph(model, batch)
-
         target_params = [(n, p) for n, p in model.named_parameters()
                          if param_cache_check(n, p) and p.requires_grad]
+        param_list = [p for _, p in target_params]
 
-        # Rademacher 探测向量
-        vs = [torch.randint(0, 2, p.shape, device=p.device).float() * 2 - 1
-              for _, p in target_params]
+        # 仅对目标块求带图的一阶梯度，避免对 embedding / lm_head / norm 建完整二阶图（显存爆炸）
+        with _second_order_safe_attention():
+            loss = _forward_causal_lm_loss(model, batch)
+            grads = torch.autograd.grad(
+                loss, param_list, create_graph=True, allow_unused=True
+            )
 
-        # 计算 g·v 的标量，再对参数求梯度得到真正的 Hv
-        grads = torch.autograd.grad(loss, [p for _, p in target_params],
-                                    create_graph=True)
-        gv = sum((g * v).sum() for g, v in zip(grads, vs))
-        hvps = torch.autograd.grad(gv, [p for _, p in target_params],
-                                   retain_graph=False)
+            vs = [torch.randint(0, 2, p.shape, device=p.device).float() * 2 - 1
+                  for p in param_list]
 
-        for (name, _), v, hv in zip(target_params, vs, hvps):
-            contrib = (v * hv).detach()
+            gv = None
+            for g, v in zip(grads, vs):
+                if g is None:
+                    continue
+                t = (g * v).sum()
+                gv = t if gv is None else gv + t
+            if gv is None:
+                raise RuntimeError("Hutchinson: no usable grads for target_params")
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            n_pl = len(param_list)
+            hv_list: list = [None] * n_pl
+            for i, p in enumerate(param_list):
+                hvi = torch.autograd.grad(
+                    gv,
+                    (p,),
+                    retain_graph=(i < n_pl - 1),
+                    allow_unused=True,
+                )[0]
+                hv_list[i] = hvi
+            del grads, gv, loss
+        for i, ((name, _), v) in enumerate(zip(target_params, vs)):
+            hv = hv_list[i]
+            if hv is None:
+                continue
+            contrib = (v * hv).detach().cpu()
             if name not in diag_accum:
                 diag_accum[name] = contrib.clone()
             else:
-                diag_accum[name] += contrib
+                diag_accum[name] = diag_accum[name] + contrib
+            hv_list[i] = None
+            vs[i] = None
+        del hv_list, vs
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     for n in diag_accum:
         diag_accum[n] /= n_samples
@@ -137,41 +238,79 @@ def compute_hvp(
     model: PreTrainedModel,
     dataloader: DataLoader,
     probe: str = "random",
+    *,
+    batch: dict | None = None,
 ) -> dict:
     """
     方案 B teacher signal: 精确计算 Hv，返回 {param_name: (v, Hv)}.
     probe: 'random' | 'param' | 'gradient'
+    If ``batch`` is given, use it (cloned); else ``next(iter(dataloader))``.
     """
     model.eval()
     model.zero_grad()
-    batch = next(iter(dataloader))
-    loss = compute_loss_and_backward_with_graph(model, batch)
+    if batch is None:
+        batch_in = next(iter(dataloader))
+    else:
+        batch_in = clone_lm_batch(batch)
 
     target_params = [(n, p) for n, p in model.named_parameters()
                      if param_cache_check(n, p) and p.requires_grad]
+    param_list = [p for _, p in target_params]
 
-    # 选择探测方向
-    vs = []
-    for _, p in target_params:
-        if probe == "random":
-            v = torch.randn_like(p)
-        elif probe == "param":
-            v = p.detach() / (p.norm() + 1e-8)
-        elif probe == "gradient":
-            v = p.grad.detach() / (p.grad.norm() + 1e-8) if p.grad is not None \
-                else torch.randn_like(p)
-        else:
-            raise ValueError(f"Unknown probe: {probe}")
-        vs.append(v)
+    with _second_order_safe_attention():
+        loss = _forward_causal_lm_loss(model, batch_in)
+        grads_w = torch.autograd.grad(
+            loss, param_list, create_graph=True, allow_unused=True
+        )
 
-    grads = torch.autograd.grad(loss, [p for _, p in target_params],
-                                create_graph=True)
-    gv = sum((g * v).sum() for g, v in zip(grads, vs))
-    hvps = torch.autograd.grad(gv, [p for _, p in target_params],
-                               retain_graph=False)
+        vs = []
+        for i, (_, p) in enumerate(target_params):
+            g_i = grads_w[i]
+            if probe == "random":
+                vs.append(torch.randn_like(p))
+            elif probe == "param":
+                vs.append(p.detach() / (p.norm() + 1e-8))
+            elif probe == "gradient":
+                if g_i is None:
+                    vs.append(torch.randn_like(p))
+                else:
+                    vs.append(g_i.detach() / (g_i.norm() + 1e-8))
+            else:
+                raise ValueError(f"Unknown probe: {probe}")
 
-    return {name: (v.detach(), hv.detach())
-            for (name, _), v, hv in zip(target_params, vs, hvps)}
+        gv = None
+        for g, v in zip(grads_w, vs):
+            if g is None:
+                continue
+            t = (g * v).sum()
+            gv = t if gv is None else gv + t
+        if gv is None:
+            raise RuntimeError("compute_hvp: no usable grads for target_params")
+        # 一次性 grad(gv, param_list) 会为所有层同时分配梯度缓冲，3B 上易 OOM；
+        # 逐参数求 ∂gv/∂θᵢ（与整块 Hv 在 θᵢ 上分量一致），峰值显存更低。
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        n_pl = len(param_list)
+        out: dict = {}
+        for i, ((name, _), v) in enumerate(zip(target_params, vs)):
+            p = param_list[i]
+            hvi = torch.autograd.grad(
+                gv,
+                (p,),
+                retain_graph=(i < n_pl - 1),
+                allow_unused=True,
+            )[0]
+            if hvi is not None:
+                out[name] = (v.detach().cpu(), hvi.detach().cpu())
+            del hvi
+
+        del grads_w, gv, loss
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return out
 
 
 # ─────────────────────────────────────────────
@@ -181,16 +320,22 @@ def compute_hvp(
 def extract_block_features(
     model: PreTrainedModel,
     dataloader: DataLoader,
+    *,
+    batch: dict | None = None,
 ) -> dict:
     """
     神经元级特征提取：block = weight matrix 的一行（一个神经元）。
     Returns {param_name: z_b} where z_b shape = (n_rows, 2*d_col + 2).
     每行特征: [θ_row (d_col,), g_row (d_col,), layer_idx (1,), block_type (1,)]
+    If ``batch`` is given, use it (cloned); else ``next(iter(dataloader))``.
     """
     model.eval()
     model.zero_grad()
-    batch = next(iter(dataloader))
-    compute_loss_and_backward(model, batch)
+    if batch is None:
+        work = next(iter(dataloader))
+    else:
+        work = clone_lm_batch(batch)
+    compute_loss_and_backward(model, work)
 
     features = {}
     layer_names = [n for n, p in model.named_parameters() if param_cache_check(n, p)]
@@ -217,55 +362,65 @@ def extract_block_features(
 class CurvatureSurrogate(nn.Module):
     """
     方案 A: z_b (n_rows, 2*d_col+2) → ĥ_b (n_rows,)
-    每行独立预测曲率，共享 MLP 权重。
-    输入维度在 forward 时动态适配（通过 lazy Linear）。
+    每个不同的特征维（由该块的 d_col 决定）使用一套独立 MLP，避免 q_proj / mlp 等 d_col 混用同一层。
     """
+
     def __init__(self, hidden: int = 64):
         super().__init__()
         self.hidden = hidden
-        self.net = None  # 延迟初始化，等第一次 forward 时确定输入维度
+        self._nets = nn.ModuleDict()
 
-    def _build(self, in_dim: int):
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, self.hidden), nn.LayerNorm(self.hidden), nn.GELU(),
-            nn.Linear(self.hidden, self.hidden // 2), nn.GELU(),
+    def _make_net(self, in_dim: int) -> nn.Sequential:
+        return nn.Sequential(
+            nn.Linear(in_dim, self.hidden),
+            nn.LayerNorm(self.hidden),
+            nn.GELU(),
+            nn.Linear(self.hidden, self.hidden // 2),
+            nn.GELU(),
             nn.Linear(self.hidden // 2, 1),
             nn.Softplus(),
         )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        # z: (n_rows, in_dim)
-        if self.net is None:
-            self._build(z.shape[-1])
-            self.net = self.net.to(z.device)
-        return self.net(z).squeeze(-1)  # (n_rows,)
+        # z: (n_rows, in_dim); in_dim = 2*d_col+2 随块变化
+        in_dim = z.shape[-1]
+        key = str(in_dim)
+        if key not in self._nets:
+            self._nets[key] = self._make_net(in_dim)
+            self._nets[key] = self._nets[key].to(device=z.device, dtype=z.dtype)
+        return self._nets[key](z).squeeze(-1)  # (n_rows,)
+
+
+class _HVPSurrogateBlock(nn.Module):
+    def __init__(self, z_dim: int, v_dim: int, hidden: int):
+        super().__init__()
+        self.z_enc = nn.Sequential(nn.Linear(z_dim, hidden), nn.GELU())
+        self.v_enc = nn.Sequential(nn.Linear(v_dim, hidden), nn.GELU())
+        self.out = nn.Linear(hidden, v_dim)
+
+    def forward(self, z: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        return self.out(self.z_enc(z) * self.v_enc(v))
 
 
 class HVPSurrogate(nn.Module):
     """
     方案 B: f_φ(z_b, v) → Ĥv
     z_b: (n_rows, 2*d_col+2), v: (n_rows, d_col) → output: (n_rows, d_col)
-    双编码器：z_b 和 v 分别编码后 element-wise 交互。
+    按 (z_dim, v_dim) 分块：不同层的 d_col 不同，不能共用一套 Linear。
     """
+
     def __init__(self, hidden: int = 64):
         super().__init__()
         self.hidden = hidden
-        self.z_enc = None
-        self.v_enc = None
-        self.out   = None
-
-    def _build(self, z_dim: int, v_dim: int):
-        self.z_enc = nn.Sequential(nn.Linear(z_dim, self.hidden), nn.GELU())
-        self.v_enc = nn.Sequential(nn.Linear(v_dim, self.hidden), nn.GELU())
-        self.out   = nn.Linear(self.hidden, v_dim)
+        self._blocks = nn.ModuleDict()
 
     def forward(self, z: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        # z: (n_rows, z_dim), v: (n_rows, d_col)
-        if self.z_enc is None:
-            self._build(z.shape[-1], v.shape[-1])
-            for m in [self.z_enc, self.v_enc, self.out]:
-                m.to(z.device)
-        return self.out(self.z_enc(z) * self.v_enc(v))  # (n_rows, d_col)
+        z_dim, v_dim = z.shape[-1], v.shape[-1]
+        key = f"{z_dim}_{v_dim}"
+        if key not in self._blocks:
+            blk = _HVPSurrogateBlock(z_dim, v_dim, self.hidden)
+            self._blocks[key] = blk.to(device=z.device, dtype=z.dtype)
+        return self._blocks[key](z, v)
 
 
 
@@ -320,27 +475,36 @@ def train_surrogate_b(
     n_epochs: int = 30,
     lr: float = 1e-3,
     probe: str = "random",
+    *,
+    batches_per_epoch: int = 8,
 ) -> HVPSurrogate:
     """
     方案 B: 训练 HVPSurrogate 预测 Hv。
     输入 (z_b, v_rows)，输出 Ĥv: (n_rows, d_col)
+
+    ``batches_per_epoch``: 每个 epoch 用多少个 calibration batch 构造 teacher（累加 MSE 再 step）。
+    默认 8；设为 1 则与原先「每 epoch 一个 batch」一致；不可超过 ``len(dataloader)``。
     """
     surrogate = HVPSurrogate()
     opt = None
+    n_pe = max(1, min(int(batches_per_epoch), len(dataloader)))
 
     for epoch in range(n_epochs):
-        hvp_data = compute_hvp(model, dataloader, probe=probe)
-        features = extract_block_features(model, dataloader)
-
+        it = iter(dataloader)
         total_loss = torch.tensor(0.0)
         n_blocks = 0
-        for name, z_b in features.items():
-            if name not in hvp_data:
-                continue
-            v, hv = hvp_data[name]          # v, hv: (n_rows, d_col)
-            pred = surrogate(z_b.float(), v.cpu().float())  # (n_rows, d_col)
-            total_loss = total_loss + F.mse_loss(pred, hv.cpu().float())
-            n_blocks += 1
+        for _ in range(n_pe):
+            raw = next(it)
+            hvp_data = compute_hvp(model, dataloader, probe=probe, batch=raw)
+            features = extract_block_features(model, dataloader, batch=raw)
+
+            for name, z_b in features.items():
+                if name not in hvp_data:
+                    continue
+                v, hv = hvp_data[name]          # v, hv: (n_rows, d_col)
+                pred = surrogate(z_b.float(), v.cpu().float())  # (n_rows, d_col)
+                total_loss = total_loss + F.mse_loss(pred, hv.cpu().float())
+                n_blocks += 1
 
         if n_blocks == 0:
             continue
@@ -353,7 +517,7 @@ def train_surrogate_b(
         opt.step()
 
         if (epoch + 1) % 10 == 0:
-            print(f"  [B] epoch {epoch+1}/{n_epochs}  loss={total_loss.item()/n_blocks:.4f}")
+            print(f"  [B] epoch {epoch+1}/{n_epochs}  loss={total_loss.item()/n_blocks:.4f}  ({n_pe} calib batches/epoch)")
 
     return surrogate
 
@@ -416,9 +580,15 @@ def compute_and_cache_metrics(
     learned_a_scores = {}
     learned_b_scores = {}
     if surrogate_a is not None or surrogate_b is not None:
-        features = extract_block_features(model, val_loader)
+        probe_batch = next(iter(val_loader))
+        features = extract_block_features(model, val_loader, batch=probe_batch)
         surrogate_a and surrogate_a.eval()
         surrogate_b and surrogate_b.eval()
+
+        # compute_hvp 必须建二阶图；不可放在 torch.no_grad() 内（否则会报 loss 无 grad_fn）。
+        hvp_data: dict = {}
+        if surrogate_b is not None:
+            hvp_data = compute_hvp(model, val_loader, probe="param", batch=probe_batch)
 
         with torch.no_grad():
             for name, z_b in features.items():
@@ -426,7 +596,6 @@ def compute_and_cache_metrics(
                     learned_a_scores[name] = surrogate_a(z_b.float())  # (n_rows,)
 
             if surrogate_b is not None:
-                hvp_data = compute_hvp(model, val_loader, probe="param")
                 for name, z_b in features.items():
                     if name in hvp_data:
                         v, _ = hvp_data[name]
