@@ -1,0 +1,16 @@
+# Conda environment (PyTorch / CUDA wheels come from pip — install after create).
+#
+#   conda env create -f environment.yml    # skip if env `lhs` already exists
+#   conda activate lhs
+#   pip install -r requirements.txt
+#
+# For a specific CUDA build, install PyTorch from https://pytorch.org/get-started/locally/
+# before other packages, e.g.:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+#
+name: lhs
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
