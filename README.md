@@ -140,19 +140,8 @@ MMLU_CALIB_SPLIT=test bash run_mmlu_hs_math.sh
 bash run_remaining.sh
 ```
 
-### 4. 仅补 Learned-A（不重跑 B / Fisher / Gradient）
 
-```bash
-# 串行
-DATASETS=c4 GPUS=6 bash supplement_learned_a.sh
-
-# C4 与 MMLU 并行
-PARALLEL=1 GPU_C4=4 GPU_MMLU=5 \
-  HF_ENDPOINT=https://hf-mirror.com C4_NO_FALLBACK=1 \
-  bash supplement_learned_a.sh
-```
-
-### 5. Q/K/V/O 热力图（Model Shapley 风格）
+### 5. 可视化Q/K/V/O 热力图
 
 每个任务目录生成 `heatmap_combined.png`（4 指标横排）：
 
@@ -218,53 +207,6 @@ python3 plot_shapley_heatmap.py --scores_dir ./results_c4 \
 
 ---
 
-## 实验结论（当前配置摘要）
-
-- **WikiText**：freeze 0.05–0.07 时 Fisher / Gradient / Learned-A 接近 baseline PPL；**Learned-B** 明显更差；Fisher vs Learned-B 的 Kendall τ ≈ 0。  
-- **C4**：下游 PPL 对方法有区分度；校准需**真 C4**（`download_c4_calib.sh` + `C4_NO_FALLBACK=1`）。  
-- **MMLU `abstract_algebra`**：3B 上 accuracy ≈ 22%（近随机），冻 neuron 后曲线平坦，**不宜作主图**；可换 `high_school_mathematics` 等较易 subject（`run_mmlu_hs_math.sh`）。  
-- **热力图**：各任务分数不同，体现 **task-specific** 重要性分布。
-
----
-
-## 显存与 OOM
-
-- `run_experiment`（`learned_scheme both`）单卡约需 **22–28 GiB**（与 `seq_len`、`hutchinson_samples` 有关）。  
-- 与他人**共享半卡**时：
-
-  ```bash
-  CUDA_MEM_FRACTION=0.48 CUDA_VISIBLE_DEVICES=5 python3 run_experiment.py ...
-  ```
-
-- 仍 OOM：减小 `SEQ_LEN=32`、`N_CALIB=32`、`HUTCH=1`，或 `--learned_scheme a` 只训 A。
-
----
-
-## Git 提交建议
-
-体积较大的目录已在 `.gitignore` 中忽略 `Qwen2.5-3B-Instruct/`、`results/`。若 `scripts/results_*` 也被提交，可在 `.gitignore` 增加：
-
-```
-scripts/results_*/
-scripts/*.log
-scripts/data/
-```
-
-提交前建议只保留：**代码、`requirements.txt`、本 README、`计划书.md`（可选）**；图表可放 release / 网盘。
-
-```bash
-git add README.md scripts/*.py scripts/*.sh requirements.txt environment.yml .gitignore
-git commit -m "Add README and document experiment pipeline"
-git push
-```
-
----
-
-## 引用
-
-若使用 Model Shapley 基线，请引用原论文；本仓库为在其上的 Learnable Hessian（Scheme A/B）扩展实现。
-
----
 
 ## License
 
