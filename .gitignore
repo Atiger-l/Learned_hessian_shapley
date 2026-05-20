@@ -220,4 +220,7 @@ __marimo__/
 # Project artifacts (large / reproducible via scripts)
 Qwen2.5-3B-Instruct/
 results/
+scripts/results_*/
+scripts/data/
+scripts/*.log
 .venv/

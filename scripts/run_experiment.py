@@ -101,6 +101,31 @@ def _require_cuda_gpu():
     raise SystemExit(1)
 
 
+def apply_cuda_memory_fraction(fraction: float | None = None) -> None:
+    """
+    Cap this process to a fraction of GPU *total* memory (cuda:0 after CUDA_VISIBLE_DEVICES).
+    Use when the card is shared, e.g. half VRAM already taken:
+
+      CUDA_MEM_FRACTION=0.48 GPU=5 python3 run_experiment.py ...
+
+    0.48 × 49GiB ≈ 23GiB cap for this job; tune with nvidia-smi (free / total).
+    """
+    if fraction is None:
+        raw = os.environ.get("CUDA_MEM_FRACTION", "").strip()
+        if not raw:
+            return
+        fraction = float(raw)
+    if not (0.0 < fraction <= 1.0):
+        raise ValueError(f"CUDA_MEM_FRACTION must be in (0, 1], got {fraction}")
+    torch.cuda.set_per_process_memory_fraction(fraction, device=0)
+    total_gib = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+    print(
+        f"CUDA memory cap: fraction={fraction:.2f} "
+        f"(~{fraction * total_gib:.1f} GiB max on logical cuda:0)",
+        flush=True,
+    )
+
+
 def _kendall_fisher_vs_learned(scores: dict, learned_key: str) -> tuple[float, float] | None:
     """Flatten Fisher vs learned scores over shared parameter blocks; return (tau, p) or None."""
     if "shapley_fisher" not in scores or learned_key not in scores:
@@ -122,6 +147,7 @@ def _kendall_fisher_vs_learned(scores: dict, learned_key: str) -> tuple[float, f
 
 def main(args):
     _require_cuda_gpu()
+    apply_cuda_memory_fraction(getattr(args, "cuda_mem_fraction", None))
     print(f"Loading model: {args.model}")
     tokenizer, model = load_tokenizer_and_causal_lm(args.model)
     model.eval()
@@ -206,6 +232,13 @@ if __name__ == "__main__":
     )
     p.add_argument("--surrogate_epochs", type=int, default=30)
     p.add_argument("--hutchinson_samples", type=int, default=5)
+    p.add_argument(
+        "--cuda_mem_fraction",
+        type=float,
+        default=None,
+        help="Max fraction of GPU total VRAM for this process (or env CUDA_MEM_FRACTION). "
+        "Use ~0.45–0.50 when sharing a half-full GPU.",
+    )
     p.add_argument(
         "--surrogate_batches_per_epoch",
         type=int,

@@ -10,7 +10,8 @@
 #   PIPELINE=wikitext   # wikitext | mmlu | c4 | all（默认 wikitext；all 会依次跑三种，耗时很长）
 #   LEARNED_SCHEME=b    # a | b | both — scheme B 为 HVP 代理；OOM 可试 SEQ_LEN=32 N_CALIB=32
 #   SURR_BATCHES_PER_EPOCH=16  # 可选：方案 B 每 epoch 用几条 calibration batch 堆 teacher（不设则 Python 默认 8）
-#   CUDA_VISIBLE_DEVICES=3    # 默认只用物理 2 号卡；需多卡时再设为 2,3 等
+#   CUDA_VISIBLE_DEVICES=2    # run_experiment 单进程只用 1 张卡；多任务并行见 run_all_experiments.sh
+#   GPUS=2,3,4,5,6,7          # plot_eval_sweep 并行 sweep 用（run_sweep_*.sh / run_all_experiments.sh）
 #   USE_OFFICIAL_HF=1                  # 直连官方 huggingface.co（默认改用镜像，见脚本内）
 #   HF_ENDPOINT=https://xxxx           # 自定义镜像（不设则默认 hf-mirror）
 #   CONDA_ENV=lhs                       # 若使用 conda，要激活的环境名
@@ -31,7 +32,9 @@ fi
 # ── GPU / Hugging Face ────────────────────────────────────────────────────
 # 默认只用物理 GPU 2（进程内为 cuda:0）。多卡示例: CUDA_VISIBLE_DEVICES=2,3 且 LHS_DEVICE_MAP=auto
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
-echo "CUDA: CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES (单卡时进程内即 cuda:0)"
+export GPUS="${GPUS:-2,3,4,5,6,7}"
+echo "CUDA: CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES (本脚本单次 run_experiment 占 1 卡)"
+echo "GPUS=$GPUS (仅 plot_eval_sweep / run_sweep_*.sh 使用多卡并行)"
 # 计算节点常出现 [Errno 101] 无法访问 huggingface.co；默认走 hf-mirror（与 huggingface_hub 兼容）
 # 需要官方源时：USE_OFFICIAL_HF=1 bash 命令行.sh
 if [[ "${USE_OFFICIAL_HF:-0}" == "1" ]]; then
