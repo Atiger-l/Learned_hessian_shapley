@@ -20,7 +20,7 @@ def load_tokenizer_and_causal_lm(model_path: str):
     common = dict(trust_remote_code=True, attn_implementation="eager")
 
     if torch.cuda.is_available():
-        common["dtype"] = torch.bfloat16
+        common["torch_dtype"] = torch.bfloat16
         use_auto = os.environ.get("LHS_DEVICE_MAP", "").strip().lower() == "auto"
         if use_auto:
             try:
@@ -44,7 +44,7 @@ def load_tokenizer_and_causal_lm(model_path: str):
             "Fix driver/PyTorch CUDA mismatch or run on a GPU node."
         )
         model = AutoModelForCausalLM.from_pretrained(
-            model_path, device_map=None, dtype=torch.float32, **common
+            model_path, device_map=None, torch_dtype=torch.float32, **common
         )
 
     return tokenizer, model

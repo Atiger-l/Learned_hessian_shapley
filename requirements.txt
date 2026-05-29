@@ -12,5 +12,7 @@ torch>=2.0
 transformers>=4.36
 datasets>=2.14
 accelerate>=0.26
-tqdm
-scipy
+# Optional — post-training GPTQ baseline (scripts/quantize.py --method gptq):
+#   pip install gptqmodel
+#   # or: pip install auto-gptq optimum
+# Shapley row quant (--method shapley_row) needs no extra packages.
